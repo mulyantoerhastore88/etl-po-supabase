@@ -3,10 +3,12 @@ import requests
 import io
 import os
 import json
+import numpy as np
 from fastapi import FastAPI
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+from supabase import create_client, Client
 
 app = FastAPI()
 
@@ -18,6 +20,9 @@ FILE_ID = "1aTD-tydMAg-jTA6UTNwPvL7rZM-Gy_sb"
 SUPABASE_URL = "https://xpahnvlkwmgenkehcmtb.supabase.co"
 SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+
+# Initialize Supabase client
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ==============================
 # GOOGLE DRIVE AUTH
@@ -77,25 +82,29 @@ def transform(file):
 # ==============================
 
 def upload_to_supabase(df):
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json"
-    }
+    # 1. Bersihkan data agar kompatibel dengan JSON
+    # Ubah semua kolom datetime menjadi string (ISO format)
+    for col in df.select_dtypes(include=['datetime64', 'datetime64[ns]']).columns:
+        df[col] = df[col].astype(str)
+    
+    # Ubah nilai NaN/None menjadi None standar python (bukan np.nan)
+    # dan ubah Infinity menjadi null
+    df = df.replace([np.inf, -np.inf], None)
+    df = df.where(pd.notnull(df), None)
 
-    # delete all data
-    requests.delete(
-        f"{SUPABASE_URL}/rest/v1/purchase_order?id=gt.0",
-        headers=headers
-    )
-
-    # insert new data
+    # 2. Konversi ke list of dictionaries
     data = df.to_dict(orient="records")
-    requests.post(
-        f"{SUPABASE_URL}/rest/v1/purchase_order",
-        headers=headers,
-        json=data
-    )
+    
+    print(f"Menghapus data lama...")
+    # Delete all data
+    supabase.table("purchase_order").delete().neq("id", 0).execute()
+    
+    print(f"Mengunggah {len(data)} baris ke Supabase...")
+    # Insert new data using upsert
+    response = supabase.table("purchase_order").upsert(data).execute()
+    
+    print(f"Status upload: {response}")
+    return response
 
 # ==============================
 # API ENDPOINT (TRIGGER ETL)
