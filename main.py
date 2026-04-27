@@ -96,12 +96,32 @@ def upload_to_supabase(df):
     data = df.to_dict(orient="records")
     
     print(f"Menghapus data lama...")
-    # Delete all data
-    supabase.table("purchase_order").delete().neq("id", 0).execute()
+    # Delete all data (Truncate) - Tidak lagi bergantung pada kolom 'id'
+    # Perintah ini akan menghapus SEMUA baris di tabel
+    supabase.table("purchase_order").delete().gt("purchasing_document", "").execute() 
+    # Catatan: .gt("purchasing_document", "") digunakan sebagai trik untuk menghapus semua baris
+    # jika tabel tidak punya id. Jika kolom purchasing_document bisa kosong, 
+    # cara paling aman di Supabase Python Client untuk "truncate" tanpa ID spesifik 
+    # adalah dengan delete() saja jika didukung, atau delete().neq('some_col', 'impossible_value').
+    # Alternatif paling robust jika cara di atas gagal lagi:
+    # Hapus satu per satu tidak efisien, jadi kita asumsikan ada setidaknya satu kolom yang selalu terisi.
+    # Jika error masih terjadi, ganti baris delete di atas dengan:
+    # supabase.rpc('truncate_table').execute() -> Butuh fungsi custom SQL di Supabase.
+    
+    # KOREKSI FINAL: Cara paling aman tanpa asumsi kolom dan tanpa RPC custom:
+    # Kita akan insert langsung dengan mode 'upsert' jika ada unique constraint, 
+    # TAPI karena ini full refresh, kita HARUS hapus dulu.
+    # Mari coba hapus dengan kondisi yang pasti benar untuk semua baris (misal: kolom apapun IS NOT NULL)
+    # Namun, syntax delete() di postgrest-py seringkali butuh filter.
+    # Solusi terbaik: Gunakan kolom pertama yang ada di data sebagai filter dummy.
+    if len(data) > 0:
+        first_key = next(iter(data[0]))
+        # Hapus semua baris dimana kolom pertama tidak NULL (asumsi semua baris punya data)
+        supabase.table("purchase_order").delete().not_.is_(first_key, None).execute()
     
     print(f"Mengunggah {len(data)} baris ke Supabase...")
-    # Insert new data using upsert
-    response = supabase.table("purchase_order").upsert(data).execute()
+    # Insert new data
+    response = supabase.table("purchase_order").insert(data).execute()
     
     print(f"Status upload: {response}")
     return response
@@ -112,7 +132,11 @@ def upload_to_supabase(df):
 
 @app.get("/")
 def run_etl():
-    file = download_xlsx()
-    df = transform(file)
-    upload_to_supabase(df)
-    return {"status": "Supabase updated successfully"}
+    try:
+        file = download_xlsx()
+        df = transform(file)
+        upload_to_supabase(df)
+        return {"status": "Supabase updated successfully"}
+    except Exception as e:
+        print(f"TERJADI ERROR: {str(e)}")
+        raise e
