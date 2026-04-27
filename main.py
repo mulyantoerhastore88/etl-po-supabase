@@ -1,79 +1,53 @@
-import os
-import requests
-import pandas as pd
-import numpy as np
 from fastapi import FastAPI
+import pandas as pd
+import requests
+import io
+import os
 from supabase import create_client
 
 app = FastAPI()
 
-# =========================
-# ENV VARIABLES (Railway)
-# =========================
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+# ambil ENV dari Railway
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# =========================
-# GOOGLE SHEET CONFIG
-# =========================
+# FILE GOOGLE SHEET (excel)
 FILE_ID = "1aTD-tydMAg-jTA6UTNwPvL7rZM-Gy_sb"
-SHEET_URL = f"https://docs.google.com/spreadsheets/d/{FILE_ID}/export?format=csv"
+DOWNLOAD_URL = f"https://docs.google.com/spreadsheets/d/{FILE_ID}/export?format=xlsx"
 
-TABLE_NAME = "purchase_order"
-
-# =========================
-# FUNCTION ETL
-# =========================
+@app.get("/")
 def run_etl():
-
     try:
-        # =========================
-        # EXTRACT
-        # =========================
-        print("Download file dari Google Drive...")
-        response = requests.get(SHEET_URL)
-        open("data.csv", "wb").write(response.content)
+        print("Download file dari Google Sheet...")
+        response = requests.get(DOWNLOAD_URL)
+        file_stream = io.BytesIO(response.content)
 
-        df = pd.read_csv("data.csv")
-        print("File berhasil dibaca:", len(df), "rows")
+        print("Baca Excel...")
+        df = pd.read_excel(file_stream)
 
-        # =========================
-        # TRANSFORM
-        # =========================
-        print("Transform data...")
+        print("Cleaning data (anti NaN error)...")
 
-        # contoh rename kolom biar aman ke postgres
-        df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+        # bersihkan nama kolom
+        df.columns = df.columns.str.strip()
 
-        # =========================
-        # CLEAN DATA (SUPER IMPORTANT)
-        # =========================
-        print("Cleaning NaN & Infinite values...")
+        # convert semua ke string supaya JSON aman
+        df = df.astype(str)
 
-        # replace infinite → NaN
-        df = df.replace([np.inf, -np.inf], np.nan)
+        # hapus value aneh dari excel/pandas
+        df = df.replace([
+            "nan","NaN","None","NaT","inf","-inf"
+        ], "")
 
-        # replace NaN → None (NULL di Supabase)
-        df = df.where(pd.notnull(df), None)
-
-        # force kolom object jadi string (hindari mixed type error)
-        for col in df.select_dtypes(include=['object']).columns:
-            df[col] = df[col].astype(str)
-
-        print("Total rows after clean:", len(df))
+        # replace numpy NaN asli
+        df = df.fillna("")
 
         # convert ke JSON records
         records = df.to_dict(orient="records")
 
-        # =========================
-        # LOAD TO SUPABASE
-        # =========================
-        print("Upload ke Supabase...")
-
-        print("Menghapus data lama...")
-        supabase.table(TABLE_NAME).delete().neq("id", 0).execute()
+        print("Hapus data lama di Supabase...")
+        supabase.table("purchase_order").delete().neq("id", 0).execute()
 
         print("Insert data baru...")
         batch_size = 500
@@ -81,9 +55,10 @@ def run_etl():
 
         for i in range(0, len(records), batch_size):
             batch = records[i:i+batch_size]
-            supabase.table(TABLE_NAME).insert(batch).execute()
+            supabase.table("purchase_order").insert(
+                [{"data": row} for row in batch]
+            ).execute()
             total_inserted += len(batch)
-            print(f"Inserted {total_inserted} rows...")
 
         return {
             "status": "SUCCESS",
@@ -95,11 +70,3 @@ def run_etl():
             "status": "ERROR",
             "message": str(e)
         }
-
-# =========================
-# API ENDPOINT
-# =========================
-@app.get("/")
-def trigger_etl():
-    result = run_etl()
-    return result
