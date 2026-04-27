@@ -21,7 +21,7 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 FILE_ID = "1aTD-tydMAg-jTA6UTNwPvL7rZM-Gy_sb"
 SHEET_URL = f"https://docs.google.com/spreadsheets/d/{FILE_ID}/export?format=csv"
 
-TABLE_NAME = "saham_volume"
+TABLE_NAME = "purchase_order"
 
 # =========================
 # FUNCTION ETL
