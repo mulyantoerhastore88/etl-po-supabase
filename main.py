@@ -1,127 +1,105 @@
-import pandas as pd
-import requests
-import io
 import os
-import json
+import requests
+import pandas as pd
+import numpy as np
 from fastapi import FastAPI
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseDownload
+from supabase import create_client
 
 app = FastAPI()
 
-# ==============================
-# ENV VARIABLES (SET DI RAILWAY)
-# ==============================
+# =========================
+# ENV VARIABLES (Railway)
+# =========================
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# =========================
+# GOOGLE SHEET CONFIG
+# =========================
 FILE_ID = "1aTD-tydMAg-jTA6UTNwPvL7rZM-Gy_sb"
-SUPABASE_URL = "https://xpahnvlkwmgenkehcmtb.supabase.co"
-SUPABASE_KEY = os.environ["SUPABASE_KEY"]
-SERVICE_ACCOUNT_JSON = os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"]
+SHEET_URL = f"https://docs.google.com/spreadsheets/d/{FILE_ID}/export?format=csv"
 
-# ==============================
-# GOOGLE DRIVE AUTH
-# ==============================
+TABLE_NAME = "saham_volume"
 
-def get_drive_service():
-    service_account_info = json.loads(SERVICE_ACCOUNT_JSON)
-
-    creds = service_account.Credentials.from_service_account_info(
-        service_account_info,
-        scopes=["https://www.googleapis.com/auth/drive"]
-    )
-
-    return build("drive", "v3", credentials=creds)
-
-# ==============================
-# DOWNLOAD FILE FROM DRIVE
-# ==============================
-
-def download_xlsx():
-    service = get_drive_service()
-    request = service.files().get_media(fileId=FILE_ID)
-
-    file = io.BytesIO()
-    downloader = MediaIoBaseDownload(file, request)
-    done = False
-
-    while not done:
-        status, done = downloader.next_chunk()
-
-    file.seek(0)
-    return file
-
-# ==============================
-# TRANSFORM EXCEL → DATAFRAME
-# ==============================
-
-def transform(file):
-    df = pd.read_excel(file)
-
-    df.columns = [
-        "purch_organization","material","short_text","plant","purchasing_document",
-        "order_type","purchasing_group","supplier","supplier_name","name_1",
-        "order_quantity","order_unit","currency","your_reference","document_date",
-        "storage_location","storage_location_desc","issuing_storage_location",
-        "issuing_storage_location_desc","release_indicator","final_approved_date",
-        "delivery_date","confirm_quantity","quantity_delivered","delivery_completed",
-        "posting_date","po_status_description","po_remarks","item","net_order_price"
-    ]
-
-    # 🔴 CLEAN NaN / Infinity → JSON safe
-    df = df.replace([float("inf"), float("-inf")], None)
-    df = df.where(pd.notnull(df), None)
-
-    return df
-
-# ==============================
-# FULL REFRESH SUPABASE (chunk insert)
-# ==============================
-
-def upload_to_supabase(df):
-    headers = {
-        "apikey": SUPABASE_KEY,
-        "Authorization": f"Bearer {SUPABASE_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    print("Menghapus data lama...")
-    requests.delete(
-        f"{SUPABASE_URL}/rest/v1/purchase_order?id=gt.0",
-        headers=headers
-    )
-
-    print("Insert data baru...")
-    records = df.to_dict(orient="records")
-    chunk_size = 500
-
-    for i in range(0, len(records), chunk_size):
-        chunk = records[i:i+chunk_size]
-        requests.post(
-            f"{SUPABASE_URL}/rest/v1/purchase_order",
-            headers=headers,
-            json=chunk
-        )
-
-    print("Upload selesai")
-
-# ==============================
-# API ENDPOINT (TRIGGER ETL)
-# ==============================
-
-@app.get("/")
+# =========================
+# FUNCTION ETL
+# =========================
 def run_etl():
+
     try:
+        # =========================
+        # EXTRACT
+        # =========================
         print("Download file dari Google Drive...")
-        file = download_xlsx()
+        response = requests.get(SHEET_URL)
+        open("data.csv", "wb").write(response.content)
 
+        df = pd.read_csv("data.csv")
+        print("File berhasil dibaca:", len(df), "rows")
+
+        # =========================
+        # TRANSFORM
+        # =========================
         print("Transform data...")
-        df = transform(file)
 
+        # contoh rename kolom biar aman ke postgres
+        df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+
+        # =========================
+        # CLEAN DATA (SUPER IMPORTANT)
+        # =========================
+        print("Cleaning NaN & Infinite values...")
+
+        # replace infinite → NaN
+        df = df.replace([np.inf, -np.inf], np.nan)
+
+        # replace NaN → None (NULL di Supabase)
+        df = df.where(pd.notnull(df), None)
+
+        # force kolom object jadi string (hindari mixed type error)
+        for col in df.select_dtypes(include=['object']).columns:
+            df[col] = df[col].astype(str)
+
+        print("Total rows after clean:", len(df))
+
+        # convert ke JSON records
+        records = df.to_dict(orient="records")
+
+        # =========================
+        # LOAD TO SUPABASE
+        # =========================
         print("Upload ke Supabase...")
-        upload_to_supabase(df)
 
-        return {"status": "SUCCESS - Supabase updated"}
+        print("Menghapus data lama...")
+        supabase.table(TABLE_NAME).delete().neq("id", 0).execute()
+
+        print("Insert data baru...")
+        batch_size = 500
+        total_inserted = 0
+
+        for i in range(0, len(records), batch_size):
+            batch = records[i:i+batch_size]
+            supabase.table(TABLE_NAME).insert(batch).execute()
+            total_inserted += len(batch)
+            print(f"Inserted {total_inserted} rows...")
+
+        return {
+            "status": "SUCCESS",
+            "rows_inserted": total_inserted
+        }
 
     except Exception as e:
-        return {"status": "ERROR", "message": str(e)}
+        return {
+            "status": "ERROR",
+            "message": str(e)
+        }
+
+# =========================
+# API ENDPOINT
+# =========================
+@app.get("/")
+def trigger_etl():
+    result = run_etl()
+    return result
